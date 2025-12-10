@@ -1,14 +1,8 @@
-// ============================================
-// SERVER CON AUTENTICAZIONE (server.js)
-// ============================================
-
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
 const path = require('path');
-const bcrypt = require('bcrypt');
-const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
@@ -27,79 +21,45 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Database persistente su file
-const DB_FILE = path.join(__dirname, 'database.json');
+// Database in memoria (si resetta al riavvio)
+let db = {
+  users: [],
+  privateMessages: [],
+  groupChats: []
+};
 
-// Carica database
-function loadDatabase() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      const data = fs.readFileSync(DB_FILE, 'utf8');
-      return JSON.parse(data);
-    }
-  } catch (error) {
-    console.error('Errore caricamento database:', error);
-  }
-  return {
-    users: [],
-    privateMessages: [],
-    groupChats: []
-  };
-}
+let onlineUsers = new Map();
+let socketToUser = new Map();
 
-// Salva database
-function saveDatabase(db) {
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-    console.log('💾 Database salvato');
-  } catch (error) {
-    console.error('❌ Errore salvataggio database:', error);
-  }
-}
-
-let db = loadDatabase();
-let onlineUsers = new Map(); // userId -> socketId
-let socketToUser = new Map(); // socketId -> userId
-
-// API REST per Registrazione
+// Registrazione (password in chiaro - solo per demo)
 app.post('/api/register', async (req, res) => {
   try {
     const { email, password, name } = req.body;
     
-    // Validazione
     if (!email || !password || !name) {
-      return res.status(400).json({ error: 'Tutti i campi sono obbligatori' });
+      return res.status(400).json({ error: 'Tutti i campi obbligatori' });
     }
     
     if (password.length < 6) {
       return res.status(400).json({ error: 'Password minimo 6 caratteri' });
     }
     
-    // Email già registrata?
     if (db.users.find(u => u.email === email)) {
       return res.status(400).json({ error: 'Email già registrata' });
     }
     
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-    
-    // Crea utente
     const user = {
       id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       email,
-      password: hashedPassword,
+      password, // ⚠️ Password in chiaro (solo per demo!)
       name,
       avatar: name.charAt(0).toUpperCase(),
-      createdAt: Date.now(),
-      lastSeen: Date.now()
+      createdAt: Date.now()
     };
     
     db.users.push(user);
-    saveDatabase(db);
+    console.log(`✅ Registrato: ${email}`);
     
-    console.log(`✅ Nuovo utente registrato: ${email}`);
-    
-    // Ritorna utente senza password
     const { password: _, ...userWithoutPassword } = user;
     res.json({ success: true, user: userWithoutPassword });
     
@@ -109,7 +69,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// API REST per Login
+// Login
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -118,27 +78,14 @@ app.post('/api/login', async (req, res) => {
       return res.status(400).json({ error: 'Email e password obbligatori' });
     }
     
-    // Trova utente
-    const user = db.users.find(u => u.email === email);
+    const user = db.users.find(u => u.email === email && u.password === password);
     
     if (!user) {
       return res.status(401).json({ error: 'Email o password errati' });
     }
     
-    // Verifica password
-    const passwordMatch = await bcrypt.compare(password, user.password);
-    
-    if (!passwordMatch) {
-      return res.status(401).json({ error: 'Email o password errati' });
-    }
-    
-    // Aggiorna ultimo accesso
-    user.lastSeen = Date.now();
-    saveDatabase(db);
-    
     console.log(`✅ Login: ${email}`);
     
-    // Ritorna utente senza password
     const { password: _, ...userWithoutPassword } = user;
     res.json({ success: true, user: userWithoutPassword });
     
@@ -150,9 +97,8 @@ app.post('/api/login', async (req, res) => {
 
 // Socket.IO
 io.on('connection', (socket) => {
-  console.log('🔌 Nuova connessione:', socket.id);
+  console.log('🔌 Connessione:', socket.id);
 
-  // Connessione utente autenticato
   socket.on('user-connected', (userId) => {
     const user = db.users.find(u => u.id === userId);
     if (!user) return;
@@ -160,7 +106,6 @@ io.on('connection', (socket) => {
     onlineUsers.set(userId, socket.id);
     socketToUser.set(socket.id, userId);
     
-    // Broadcast utenti online
     const onlineUsersList = Array.from(onlineUsers.keys()).map(id => {
       const u = db.users.find(user => user.id === id);
       if (u) {
@@ -171,11 +116,8 @@ io.on('connection', (socket) => {
     }).filter(Boolean);
     
     io.emit('users-update', onlineUsersList);
-    
-    console.log(`👤 ${user.name} connesso`);
   });
 
-  // Invia messaggio privato
   socket.on('send-private-message', (data) => {
     const { senderId, receiverId, text } = data;
     
@@ -190,21 +132,15 @@ io.on('connection', (socket) => {
     };
     
     db.privateMessages.push(message);
-    saveDatabase(db);
     
-    // Invia al mittente
     socket.emit('message-sent', message);
     
-    // Invia al destinatario se online
     const receiverSocketId = onlineUsers.get(receiverId);
     if (receiverSocketId) {
       io.to(receiverSocketId).emit('new-private-message', message);
     }
-    
-    console.log(`💬 Messaggio da ${senderId} a ${receiverId}`);
   });
 
-  // Crea gruppo
   socket.on('create-group', (data) => {
     const { creatorId, groupName, memberIds } = data;
     
@@ -218,20 +154,15 @@ io.on('connection', (socket) => {
     };
     
     db.groupChats.push(group);
-    saveDatabase(db);
     
-    // Notifica tutti i membri
     group.members.forEach(memberId => {
       const socketId = onlineUsers.get(memberId);
       if (socketId) {
         io.to(socketId).emit('group-created', group);
       }
     });
-    
-    console.log(`👥 Gruppo creato: ${groupName}`);
   });
 
-  // Messaggio gruppo
   socket.on('send-group-message', (data) => {
     const { senderId, groupId, text } = data;
     
@@ -248,9 +179,7 @@ io.on('connection', (socket) => {
     };
     
     group.messages.push(message);
-    saveDatabase(db);
     
-    // Invia a tutti i membri
     group.members.forEach(memberId => {
       const socketId = onlineUsers.get(memberId);
       if (socketId) {
@@ -259,7 +188,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Ottieni messaggi privati
   socket.on('get-private-messages', (data) => {
     const { userId, otherUserId } = data;
     
@@ -271,14 +199,12 @@ io.on('connection', (socket) => {
     socket.emit('private-messages-loaded', { messages });
   });
 
-  // Ottieni gruppi utente
   socket.on('get-my-groups', (data) => {
     const { userId } = data;
     const userGroups = db.groupChats.filter(g => g.members.includes(userId));
     socket.emit('my-groups-loaded', userGroups);
   });
 
-  // Ottieni messaggi gruppo
   socket.on('get-group-messages', (data) => {
     const { groupId } = data;
     const group = db.groupChats.find(g => g.id === groupId);
@@ -287,7 +213,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Segna come letto
   socket.on('mark-read', (data) => {
     const { userId, otherUserId } = data;
     
@@ -297,15 +222,12 @@ io.on('connection', (socket) => {
       }
     });
     
-    saveDatabase(db);
-    
     const otherSocketId = onlineUsers.get(otherUserId);
     if (otherSocketId) {
       io.to(otherSocketId).emit('messages-read', { userId });
     }
   });
 
-  // Disconnessione
   socket.on('disconnect', () => {
     const userId = socketToUser.get(socket.id);
     
@@ -313,14 +235,6 @@ io.on('connection', (socket) => {
       onlineUsers.delete(userId);
       socketToUser.delete(socket.id);
       
-      const user = db.users.find(u => u.id === userId);
-      if (user) {
-        user.lastSeen = Date.now();
-        saveDatabase(db);
-        console.log(`👋 ${user.name} disconnesso`);
-      }
-      
-      // Aggiorna lista utenti online
       const onlineUsersList = Array.from(onlineUsers.keys()).map(id => {
         const u = db.users.find(user => user.id === id);
         if (u) {
@@ -339,16 +253,13 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════════╗
-║   🔐 CHAT CON AUTENTICAZIONE AVVIATA! ✅  ║
+║         🚀 SERVER RENDER AVVIATO! ✅      ║
 ╚═══════════════════════════════════════════╝
 
-🚀 Server: http://localhost:${PORT}
-📧 Login con Email e Password
-💾 Dati salvati persistentemente
-🔒 Password crittografate con bcrypt
+🌐 Porta: ${PORT}
+💾 Database in memoria
+⚠️  I dati si resettano al riavvio
 
-Database: ${DB_FILE}
-
-Premi Ctrl+C per fermare
+Pronto per connessioni!
   `);
 });
